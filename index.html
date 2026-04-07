@@ -1,0 +1,509 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>naruto</title>
+  
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; background-color: black; }
+    #v_src, #out {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      object-fit: cover; transform: scaleX(-1);
+    }
+    #out { z-index: 2; pointer-events: none; }
+    .darkness {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: rgba(10, 5, 0, 0.3);
+      mix-blend-mode: multiply; pointer-events: none; z-index: 5;
+    }
+    .fx {
+      position: absolute; height: auto; top: 0; left: 0;
+      transform: translate(-50%, -50%);
+      pointer-events: none; display: none;
+      mix-blend-mode: screen; z-index: 20;
+    }
+    #n       { width: 1600px; }
+    #n_lock  { width: 1600px; }
+    #s       { width: 2400px; }
+    #bang {
+      position: fixed; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      pointer-events: none; z-index: 100;
+      display: none;
+    }
+    #white-flash {
+      position: fixed; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: #ffffff;
+      pointer-events: none; z-index: 150;
+      display: none;
+      opacity: 0;
+    }
+    #lock-indicator {
+      position: fixed; bottom: 30px; left: 50%;
+      transform: translateX(-50%);
+      font-family: 'Courier New', monospace;
+      font-size: 14px;
+      letter-spacing: 3px;
+      color: #00fbff;
+      text-shadow: 0 0 10px #00fbff;
+      z-index: 200;
+      opacity: 0;
+      transition: opacity 0.3s;
+      pointer-events: none;
+    }
+    #charge-bar-wrap {
+      position: fixed; bottom: 60px; left: 50%;
+      transform: translateX(-50%);
+      width: 200px; height: 6px;
+      background: rgba(255,255,255,0.15);
+      border-radius: 3px;
+      z-index: 200;
+      display: none;
+      overflow: hidden;
+    }
+    #charge-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, #ff6600, #ffdd00, #ffffff);
+      border-radius: 3px;
+      box-shadow: 0 0 8px #ffaa00;
+    }
+  </style>
+</head>
+<body>
+
+  <video id="v_src" autoplay playsinline></video>
+  <canvas id="out"></canvas>
+  <div class="darkness"></div>
+
+  <video id="n"      class="fx" src="assets/naruto.mp4"      muted autoplay loop playsinline></video>
+  <video id="n_lock" class="fx" src="assets/naruto_lock.mp4" muted        loop playsinline></video>
+  <video id="s"      class="fx" src="assets/sasuke.mp4"      muted autoplay loop playsinline></video>
+
+  <canvas id="bang"></canvas>
+  <div id="white-flash"></div>
+  <div id="lock-indicator"></div>
+  <div id="charge-bar-wrap"><div id="charge-bar"></div></div>
+
+  <script>
+    const vElement      = document.getElementById('v_src');
+    const cElement      = document.getElementById('out');
+    const ctx           = cElement.getContext('2d');
+    const n             = document.getElementById('n');
+    const nLock         = document.getElementById('n_lock');
+    const s             = document.getElementById('s');
+    const bangCanvas    = document.getElementById('bang');
+    const bangCtx       = bangCanvas.getContext('2d');
+    const lockIndicator = document.getElementById('lock-indicator');
+    const whiteFlashEl  = document.getElementById('white-flash');
+    const chargeBarWrap = document.getElementById('charge-bar-wrap');
+    const chargeBar     = document.getElementById('charge-bar');
+
+    const NARUTO_LOCK_MS = 4000;
+
+    let pwrS = 0;
+    let wasOpenS = false;
+
+    let narutoChargeMsAcc   = 0;
+    let narutoChargeStart   = null;
+    let narutoLastFrameOpen = false;
+
+    let narutoFullyLocked = false;
+    let locked    = [false, false];
+    let lockedPos = [null, null];
+
+    let thrown           = false;
+    let throwVel         = {x: 0, y: 0};
+    let thrownPos        = {x: 0, y: 0};
+    let fistHistory      = [];
+    let fistClosedFrames = 0;
+
+    let clashing      = false;
+    let bangAnimId    = null;
+    let bangParticles = [];
+
+    function checkOpen(pts) {
+      let c = 0;
+      const w = pts[0];
+      const tips = [8,12,16,20], pips = [6,10,14,18];
+      for (let i = 0; i < 4; i++) {
+        const t = pts[tips[i]], p = pts[pips[i]];
+        if (Math.hypot(t.x-w.x, t.y-w.y) > Math.hypot(p.x-w.x, p.y-w.y)) c++;
+      }
+      return c >= 3;
+    }
+
+    function checkFist(pts) {
+      let c = 0;
+      const w = pts[0];
+      const tips = [8,12,16,20], pips = [6,10,14,18];
+      for (let i = 0; i < 4; i++) {
+        const t = pts[tips[i]], p = pts[pips[i]];
+        if (Math.hypot(t.x-w.x, t.y-w.y) < Math.hypot(p.x-w.x, p.y-w.y)) c++;
+      }
+      return c >= 3;
+    }
+
+    function toScreen(nx, ny) {
+      return { x: (1-nx)*window.innerWidth, y: ny*window.innerHeight };
+    }
+
+    function dist(a, b) {
+      if (!a || !b) return Infinity;
+      return Math.hypot(a.x-b.x, a.y-b.y);
+    }
+
+    function narutoEffectPos(pts) {
+      const dx = pts[9].x - pts[0].x;
+      const dy = pts[9].y - pts[0].y;
+      const tx = pts[9].x + dx * 0.8;
+      const ty = pts[9].y + dy * 0.8;
+      return { x: (1-tx)*window.innerWidth, y: ty*window.innerHeight - 120 };
+    }
+
+    function doWhiteFlash() {
+      whiteFlashEl.style.transition = 'none';
+      whiteFlashEl.style.opacity    = '1';
+      whiteFlashEl.style.display    = 'block';
+      setTimeout(() => {
+        whiteFlashEl.style.transition = 'opacity 0.5s ease-out';
+        whiteFlashEl.style.opacity    = '0';
+        setTimeout(() => { whiteFlashEl.style.display = 'none'; }, 500);
+      }, 1000);
+    }
+
+    function triggerBang(cx, cy) {
+      clashing = true;
+      n.style.display     = 'none'; n.pause();
+      nLock.style.display = 'none'; nLock.pause();
+      s.style.display     = 'none';
+      locked              = [false, false];
+      lockedPos           = [null, null];
+      narutoFullyLocked   = false;
+      narutoChargeMsAcc   = 0;
+      narutoChargeStart   = null;
+      narutoLastFrameOpen = false;
+      pwrS                = 0;
+      thrown              = false;
+      fistHistory         = [];
+      fistClosedFrames    = 0;
+      chargeBarWrap.style.display = 'none';
+      chargeBar.style.width = '0%';
+
+      doWhiteFlash();
+
+      bangCanvas.width  = window.innerWidth;
+      bangCanvas.height = window.innerHeight;
+      bangCanvas.style.display = 'block';
+
+      bangParticles = [];
+      const colors = ['#ff6600','#ffaa00','#ffffff','#ff3300','#00fbff','#ff00ff','#ffff00'];
+      for (let i = 0; i < 260; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 5 + Math.random() * 22;
+        bangParticles.push({
+          x: cx, y: cy,
+          vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed,
+          size: 3 + Math.random()*15,
+          color: colors[Math.floor(Math.random()*colors.length)],
+          alpha: 1,
+          life: 0.016 + Math.random()*0.022
+        });
+      }
+
+      const rings = [
+        { r:0, maxR: Math.max(innerWidth,innerHeight)*0.9, alpha:1, width:30, color:'#ffffff' },
+        { r:0, maxR: Math.max(innerWidth,innerHeight)*0.7, alpha:0.8,width:18, color:'#ff8800' },
+        { r:0, maxR: Math.max(innerWidth,innerHeight)*0.55,alpha:0.6,width:11, color:'#00fbff' },
+      ];
+
+      let frame = 0;
+      if (bangAnimId) cancelAnimationFrame(bangAnimId);
+
+      function animateBang() {
+        bangCtx.clearRect(0, 0, bangCanvas.width, bangCanvas.height);
+        rings.forEach(ring => {
+          if (ring.r < ring.maxR) {
+            ring.r    += ring.maxR * 0.05;
+            ring.alpha = Math.max(0, 1 - ring.r/ring.maxR);
+            bangCtx.save();
+            bangCtx.globalAlpha = ring.alpha * 0.85;
+            bangCtx.strokeStyle = ring.color;
+            bangCtx.lineWidth   = ring.width * ring.alpha;
+            bangCtx.shadowBlur  = 40;
+            bangCtx.shadowColor = ring.color;
+            bangCtx.beginPath();
+            bangCtx.arc(cx, cy, ring.r, 0, Math.PI*2);
+            bangCtx.stroke();
+            bangCtx.restore();
+          }
+        });
+        bangParticles.forEach(p => {
+          if (p.alpha <= 0) return;
+          p.x += p.vx; p.y += p.vy;
+          p.vy += 0.2; p.vx *= 0.97;
+          p.alpha -= p.life;
+          bangCtx.save();
+          bangCtx.globalAlpha = Math.max(0, p.alpha);
+          bangCtx.fillStyle   = p.color;
+          bangCtx.shadowBlur  = 14;
+          bangCtx.shadowColor = p.color;
+          bangCtx.beginPath();
+          bangCtx.arc(p.x, p.y, p.size * Math.max(0, p.alpha), 0, Math.PI*2);
+          bangCtx.fill();
+          bangCtx.restore();
+        });
+        if (frame < 30) {
+          const gr = (200 - frame*5) * Math.max(0, 1 - frame/30);
+          if (gr > 0) {
+            const grd = bangCtx.createRadialGradient(cx,cy,0, cx,cy,gr);
+            grd.addColorStop(0,   'rgba(255,255,200,0.9)');
+            grd.addColorStop(0.3, 'rgba(255,120,0,0.6)');
+            grd.addColorStop(1,   'rgba(255,60,0,0)');
+            bangCtx.save();
+            bangCtx.globalAlpha = Math.max(0, 1 - frame/30);
+            bangCtx.fillStyle   = grd;
+            bangCtx.beginPath();
+            bangCtx.arc(cx, cy, gr, 0, Math.PI*2);
+            bangCtx.fill();
+            bangCtx.restore();
+          }
+        }
+        frame++;
+        const alive = bangParticles.some(p => p.alpha > 0) || rings.some(r => r.alpha > 0);
+        if (alive && frame < 220) {
+          bangAnimId = requestAnimationFrame(animateBang);
+        } else {
+          bangCanvas.style.display = 'none';
+          clashing = false;
+        }
+      }
+      animateBang();
+    }
+
+    setInterval(() => {
+      if (!thrown) return;
+      thrownPos.x += throwVel.x;
+      thrownPos.y += throwVel.y;
+      throwVel.x  *= 0.995;
+      throwVel.y  *= 0.995;
+      nLock.style.left    = `${thrownPos.x}px`;
+      nLock.style.top     = `${thrownPos.y}px`;
+      nLock.style.display = 'block';
+      nLock.style.opacity = '1';
+      if (locked[1] && lockedPos[1]) {
+        if (dist(thrownPos, lockedPos[1]) < 350) {
+          const cx = (thrownPos.x + lockedPos[1].x) / 2;
+          const cy = (thrownPos.y + lockedPos[1].y) / 2;
+          triggerBang(cx, cy);
+          thrown = false;
+          return;
+        }
+      }
+      const M = 700;
+      if (thrownPos.x < -M || thrownPos.x > innerWidth+M ||
+          thrownPos.y < -M || thrownPos.y > innerHeight+M) {
+        thrown              = false;
+        nLock.style.display = 'none'; nLock.pause();
+        locked[0]           = false;
+        narutoFullyLocked   = false;
+        lockedPos[0]        = null;
+        narutoChargeMsAcc   = 0;
+      }
+    }, 16);
+
+    function onResults(res) {
+      if (clashing) return;
+      cElement.width  = vElement.videoWidth;
+      cElement.height = vElement.videoHeight;
+      ctx.save();
+      ctx.clearRect(0, 0, cElement.width, cElement.height);
+      if (!thrown) {
+        n.style.display     = 'none';
+        nLock.style.display = 'none';
+      }
+      s.style.display = 'none';
+      let seenLeft  = false;
+      let seenRight = false;
+      const now = Date.now();
+      if (res.multiHandLandmarks && res.multiHandedness) {
+        res.multiHandLandmarks.forEach((pts, i) => {
+          const isR = res.multiHandedness[i].label === 'Right';
+          const open = checkOpen(pts);
+          const fist = checkFist(pts);
+          const wristSc = toScreen(pts[0].x, pts[0].y);
+          if (!isR) {
+            seenLeft = true;
+            if (!narutoFullyLocked) {
+              if (open) {
+                const delta = narutoChargeStart ? (now - narutoChargeStart) : 0;
+                narutoChargeMsAcc += delta;
+                narutoChargeStart  = now;
+                if (!narutoLastFrameOpen) { n.currentTime = 0; n.play(); }
+                const ratio = Math.min(1, narutoChargeMsAcc / NARUTO_LOCK_MS);
+                const pos   = narutoEffectPos(pts);
+                n.style.left    = `${pos.x}px`;
+                n.style.top     = `${pos.y}px`;
+                n.style.display = 'block';
+                n.style.opacity = String(0.35 + 0.65 * ratio);
+                chargeBarWrap.style.display = 'block';
+                chargeBar.style.width = `${ratio * 100}%`;
+                if (narutoChargeMsAcc >= NARUTO_LOCK_MS) {
+                  narutoFullyLocked = true;
+                  locked[0]         = true;
+                  lockedPos[0] = narutoEffectPos(pts);
+                  n.style.display     = 'none';
+                  n.pause();
+                  nLock.style.left    = `${lockedPos[0].x}px`;
+                  nLock.style.top     = `${lockedPos[0].y}px`;
+                  nLock.style.display = 'block';
+                  nLock.style.opacity = '1';
+                  nLock.currentTime   = 0;
+                  nLock.play();
+                  chargeBarWrap.style.display = 'none';
+                  chargeBar.style.width = '0%';
+                }
+              } else {
+                narutoChargeStart = null;
+                narutoChargeMsAcc = Math.max(0, narutoChargeMsAcc - 250);
+                if (narutoChargeMsAcc > 0) {
+                  const ratio = narutoChargeMsAcc / NARUTO_LOCK_MS;
+                  const pos   = narutoEffectPos(pts);
+                  n.style.left    = `${pos.x}px`;
+                  n.style.top     = `${pos.y}px`;
+                  n.style.display = 'block';
+                  n.style.opacity = String(0.35 + 0.65 * ratio);
+                  chargeBarWrap.style.display = 'block';
+                  chargeBar.style.width = `${ratio * 100}%`;
+                } else {
+                  chargeBarWrap.style.display = 'none';
+                  chargeBar.style.width = '0%';
+                  n.style.display = 'none';
+                }
+              }
+              narutoLastFrameOpen = open;
+            }
+            if (narutoFullyLocked && !thrown) {
+              if (fist) {
+                fistClosedFrames++;
+                fistHistory.push({x: wristSc.x, y: wristSc.y, t: now});
+                if (fistHistory.length > 8) fistHistory.shift();
+              } else {
+                if (fistClosedFrames > 2 && fistClosedFrames < 25 && fistHistory.length >= 3) {
+                  const old  = fistHistory[0];
+                  const last = fistHistory[fistHistory.length - 1];
+                  const dt   = Math.max(1, last.t - old.t);
+                  const vx   = (last.x - old.x) / dt * 16;
+                  const vy   = (last.y - old.y) / dt * 16;
+                  if (Math.hypot(vx, vy) > 1.5) {
+                    thrown    = true;
+                    thrownPos = { ...lockedPos[0] };
+                    throwVel  = { x: vx, y: vy };
+                  }
+                }
+                fistHistory      = [];
+                fistClosedFrames = 0;
+              }
+              if (!thrown) {
+                const pos    = narutoEffectPos(pts);
+                lockedPos[0] = pos;
+                nLock.style.left    = `${pos.x}px`;
+                nLock.style.top     = `${pos.y}px`;
+                nLock.style.display = 'block';
+                nLock.style.opacity = '1';
+              }
+            }
+          }
+          if (isR) {
+            seenRight = true;
+            if (!locked[1]) {
+              pwrS += open ? 0.05 : -0.15;
+              pwrS  = Math.max(0, Math.min(1, pwrS));
+              if (open && !wasOpenS) { s.currentTime = 0; s.play(); }
+              wasOpenS = open;
+              if (pwrS >= 1.0) {
+                locked[1] = true;
+                const tx  = (pts[0].x + pts[9].x) / 2;
+                const ty  = (pts[0].y + pts[9].y) / 2;
+                lockedPos[1] = { x: (1-tx)*innerWidth, y: ty*innerHeight };
+              }
+            }
+            if (locked[1]) {
+              const tx = (pts[0].x + pts[9].x) / 2;
+              const ty = (pts[0].y + pts[9].y) / 2;
+              lockedPos[1]    = { x: (1-tx)*innerWidth, y: ty*innerHeight };
+              s.style.left    = `${lockedPos[1].x}px`;
+              s.style.top     = `${lockedPos[1].y}px`;
+              s.style.display = 'block';
+              s.style.opacity = '1';
+            } else if (pwrS > 0.01) {
+              const tx = (pts[0].x + pts[9].x) / 2;
+              const ty = (pts[0].y + pts[9].y) / 2;
+              s.style.left    = `${(1-tx)*innerWidth}px`;
+              s.style.top     = `${ty*innerHeight}px`;
+              s.style.display = 'block';
+              s.style.opacity = String(pwrS);
+            }
+          }
+        });
+      }
+      if (!seenRight && !locked[1]) {
+        pwrS = Math.max(0, pwrS - 0.15);
+        if (pwrS > 0.01) { s.style.display = 'block'; s.style.opacity = String(pwrS); }
+        wasOpenS = false;
+      }
+      if (!seenLeft && !narutoFullyLocked) {
+        narutoChargeStart   = null;
+        narutoLastFrameOpen = false;
+        narutoChargeMsAcc   = Math.max(0, narutoChargeMsAcc - 150);
+        if (narutoChargeMsAcc <= 0) {
+          chargeBarWrap.style.display = 'none';
+          chargeBar.style.width = '0%';
+          n.style.display = 'none';
+        }
+      }
+      if (!clashing && locked[0] && locked[1] && lockedPos[0] && lockedPos[1]) {
+        const narPos = thrown ? thrownPos : lockedPos[0];
+        if (dist(narPos, lockedPos[1]) < 350) {
+          const cx = (narPos.x + lockedPos[1].x) / 2;
+          const cy = (narPos.y + lockedPos[1].y) / 2;
+          triggerBang(cx, cy);
+        }
+      }
+      if (locked[0] || locked[1]) {
+        const parts = [];
+        if (locked[0]) parts.push(thrown ? '⚡ NARUTO — AIRBORNE' : '🔒 NARUTO LOCKED');
+        if (locked[1]) parts.push('🔒 SASUKE LOCKED');
+        lockIndicator.textContent   = parts.join('   ');
+        lockIndicator.style.opacity = '1';
+      } else {
+        lockIndicator.style.opacity = '0';
+      }
+      ctx.restore();
+    }
+
+    const h = new Hands({
+      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+    });
+    h.setOptions({
+      maxNumHands: 2, modelComplexity: 1,
+      minDetectionConfidence: 0.65, minTrackingConfidence: 0.65
+    });
+    h.onResults(onResults);
+
+    const cam = new Camera(vElement, {
+      onFrame: async () => { await h.send({ image: vElement }); },
+      width: 1280, height: 720
+    });
+    cam.start();
+  </script>
+</body>
+</html>
